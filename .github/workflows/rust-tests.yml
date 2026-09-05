@@ -16,13 +16,28 @@ name: Rust tests
 
 on:
   workflow_call:
+    inputs:
+      chalk_on:
+        description: "racecar: instrumented arm switch, passed down by the caller"
+        type: string
+        default: "false"
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
-  group: rust-tests-${{ github.ref }}
-  cancel-in-progress: true
+  group: rust-tests-${{ github.ref }}-${{ inputs.chalk_on }}
+  cancel-in-progress: false
+
+env:
+  # The one variable that separates the arms: on baseline, action-checkout
+  # skips its Set up Chalk step entirely.
+  CHALK_ON: ${{ inputs.chalk_on }}
 
 jobs:
   bootstrap-installer:
@@ -30,16 +45,30 @@ jobs:
     # cargo builds codegen units and test binaries in parallel across the
     # cores. This lane also builds the crate from the start when Cargo.toml
     # changes.
-    runs-on: ubuntu-latest-32-core
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
       run:
         working-directory: apps/bootstrap-installer/src-tauri
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
 
       # Tauri links against the system webkit2gtk on Linux, so the crate does
       # not compile without these even for `cargo test --lib`.
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        # not the job's defaults.run.working-directory: that directory may not exist yet
+        working-directory: ${{ github.workspace }}
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: Install Tauri system dependencies
         working-directory: .
         run: |
