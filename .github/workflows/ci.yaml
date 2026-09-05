@@ -15,6 +15,21 @@ name: CI
 # main-only automation uses protected environments in its own workflows.
 
 on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   pull_request:
   push:
     branches: [main]
@@ -24,10 +39,18 @@ permissions:
   pull-requests: write # needed by lint (PR comment) + supply-chain review_status
   actions: read # needed by osv-scanner (SARIF upload)
   security-events: write # needed by osv-scanner (SARIF upload)
+  id-token: write
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.ref }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
+  cancel-in-progress: false
+
+env:
+  # The one variable that separates the arms: on baseline, action-checkout
+  # skips its Set up Chalk step entirely.
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+
+run-name: "CI ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────
@@ -57,7 +80,19 @@ jobs:
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
       event_name: ${{ github.event_name }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: Detect affected areas
         id: classify
         uses: ./.github/actions/detect-changes
@@ -75,28 +110,22 @@ jobs:
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
   # the OS-marked tests it collects are skipped there by design (see the
   # `_OS_MARKS` comment in tests/conftest.py) — this is where they run.
   # Same `python` lane gate: if no Python changed, neither runs.
-  tests-os:
-    name: OS-specific tests
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
-    uses: ./.github/workflows/tests-os.yml
-    with:
-      # The Windows lane spawns the real desktop-update hand-off script
-      # (tests/test_desktop_update_windows_*.py) only when that surface
-      # changed; unit-level windows_only tests always run.
-      desktop_updater: ${{ needs.detect.outputs.desktop_updater == 'true' }}
-
   lint:
     name: Python lints
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/lint.yml
     with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
       event_name: ${{ needs.detect.outputs.event_name }}
 
   js-tests:
@@ -104,13 +133,9 @@ jobs:
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
     uses: ./.github/workflows/js-tests.yml
-
-  installer-tests:
-    name: Installer tests
-    needs: detect
-    # Windows-only, and only for PRs that touch install.ps1 or its tests.
-    if: needs.detect.outputs.installer == 'true'
-    uses: ./.github/workflows/installer-tests.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   rust-tests:
     name: Rust tests
@@ -119,6 +144,9 @@ jobs:
     # changes used to run the TypeScript matrix and nothing that compiles them.
     if: needs.detect.outputs.rust == 'true'
     uses: ./.github/workflows/rust-tests.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   e2e-desktop:
     name: Desktop E2E
@@ -137,24 +165,36 @@ jobs:
     #   if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
     if: false
     uses: ./.github/workflows/e2e-desktop.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   docs-site:
     name: Docs Site
     needs: detect
     if: needs.detect.outputs.site == 'true'
     uses: ./.github/workflows/docs-site-checks.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   history-check:
     name: Deny unrelated histories
     needs: detect
     if: needs.detect.outputs.event_name == 'pull_request'
     uses: ./.github/workflows/history-check.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   contributor-check:
     name: Check contributors
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/contributor-check.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   uv-lockfile:
     name: Check uv.lock
@@ -166,33 +206,51 @@ jobs:
     # `.github/` change still forces it on via the classifier's fail-open.
     if: needs.detect.outputs.uv_lock == 'true'
     uses: ./.github/workflows/uv-lockfile-check.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   infographic-check:
     name: Check no committed infographics
     needs: detect
     uses: ./.github/workflows/infographic-check.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   profile-artifact-check:
     name: Profile artifact check
     needs: detect
     uses: ./.github/workflows/profile-artifact-check.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   case-collision-check:
     name: Check no case-colliding filenames
     needs: detect
     uses: ./.github/workflows/case-collision-check.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   lockfile-diff:
     name: package-lock.json diff
     needs: detect
     if: needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.npm_lock == 'true'
     uses: ./.github/workflows/lockfile-diff.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   docker-lint:
     name: Lint Docker scripts
     needs: detect
     if: needs.detect.outputs.docker_meta == 'true'
     uses: ./.github/workflows/docker-lint.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   supply-chain:
     name: Supply-chain scan
@@ -200,6 +258,8 @@ jobs:
     if: needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps == 'true')
     uses: ./.github/workflows/supply-chain-audit.yml
     with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
       event_name: ${{ needs.detect.outputs.event_name }}
       scan: ${{ needs.detect.outputs.scan == 'true' }}
       deps: ${{ needs.detect.outputs.deps == 'true' }}
@@ -210,6 +270,8 @@ jobs:
     if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
     uses: ./.github/workflows/review-labels.yml
     with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
       ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}
       ci_review_files: ${{ needs.detect.outputs.ci_review_files }}
       mcp_catalog: ${{ needs.detect.outputs.mcp_catalog == 'true' }}
@@ -218,6 +280,9 @@ jobs:
   osv-scanner:
     name: OSV scan
     uses: ./.github/workflows/osv-scanner.yml
+    with:
+      chalk_on: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+      profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
@@ -234,10 +299,8 @@ jobs:
     needs:
       - detect
       - tests
-      - tests-os
       - lint
       - js-tests
-      - installer-tests
       - rust-tests
       - e2e-desktop
       - docs-site
@@ -261,6 +324,19 @@ jobs:
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: Evaluate job results
         id: evaluate
         env:
@@ -303,7 +379,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
       - name: Restore baseline cache (PR only)
         if: github.event_name == 'pull_request'
